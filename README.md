@@ -66,23 +66,46 @@ export AGENTCUBE_HOST=127.0.0.1:8765
 
 ## Run on a real cube (ESP8266 / GeekMagic)
 
-The cube only accepts **strips** of RGB565 (max ~12 KB/request). This client sends horizontal bands (default **H=16** → 7680 bytes, 15 POSTs per frame).
+### High FPS — ACSP atomic present (default)
+
+Firmware **TCP :81**: each frame is received fully into RAM (**80×80 RGB565**), while the **previous picture stays on the LCD**. Only then a fast SPI **3× upscale** paints 240×240. That is real double-buffer semantics on ESP8266 (full 240×240 backbuffer does not fit in RAM).
+
+Measured ~**9 FPS** solid color / test pattern on LAN.
 
 ```bash
-cd /Users/dandare/Work/agentcube-doom   # or your clone
-# build once
-cd doomgeneric-src/doomgeneric && make -f Makefile.agentcube -j$(sysctl -n hw.ncpu) && cd ../..
+cd /Users/dandare/Work/agentcube-doom
+(cd doomgeneric-src/doomgeneric && make -f Makefile.agentcube -j$(sysctl -n hw.ncpu))
 
-# stream to cube LAN IP (token not required on open AgentCube builds)
-export AGENTCUBE_HOST=192.168.1.97
-export AGENTCUBE_FRAME_SKIP=2          # optional: less Wi‑Fi load
-# export AGENTCUBE_STRIP_H=12          # optional: thinner strips if Wi‑Fi drops
-
+# Same atomic path as video: 80×80 RGB565 → TCP :81 → cube 3× present
 ./doomgeneric-src/doomgeneric/doomgeneric-agentcube \
   -iwad wads/DOOM1.WAD \
   -agentcube 192.168.1.97 \
-  -frameskip 2
+  -frameskip 1 \
+  -nowindow
 ```
+
+In stderr: `ACSP TCP connected …` and `~N FPS stream (80x80 ACSP)`.
+Picture stays on the cube until the next full frame is received (no black flash).
+
+### Stream a video file (easiest visual test)
+
+```bash
+brew install ffmpeg   # once
+
+# moving test pattern (no file)
+python3 scripts/stream_video_to_cube.py -H 192.168.1.97 --test
+
+# any mp4/mkv/webm
+python3 scripts/stream_video_to_cube.py -H 192.168.1.97 -i ~/Movies/clip.mp4 --fps 12
+
+# loop
+python3 scripts/stream_video_to_cube.py -H 192.168.1.97 -i clip.mp4 --fps 15 --loop
+```
+
+Discovery: `curl http://192.168.1.97/api/v1/stream/info`
+### Legacy HTTP strips (fallback)
+
+If TCP fails, the client falls back to `POST /api/v1/draw/frame` with **H=8** strips. Do **not** use large `-striph` (OOM reboot).
 
 Quick API smoke test (no Doom):
 
