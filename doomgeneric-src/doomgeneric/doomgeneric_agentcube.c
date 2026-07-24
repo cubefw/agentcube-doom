@@ -1,5 +1,8 @@
 // doomgeneric platform: SDL window + stream frames to AgentCube (sim or cube)
 // Based on doomgeneric_sdl.c (ozkl/doomgeneric)
+//
+// ESP8266 heap cannot hold a full 240x240 RGB565 buffer (~115KB).
+// Stream in horizontal strips (default H=20 → 9600 bytes/POST).
 
 #include "doomkeys.h"
 #include "m_argv.h"
@@ -19,6 +22,9 @@
 #define KEYQUEUE_SIZE 16
 #define AC_W 240
 #define AC_H 240
+/* Max strip height: DRAW_FRAME_MAX_BYTES=12KB → 12000/(240*2)=25 lines */
+#define AC_STRIP_H_DEFAULT 16
+#define AC_STRIP_H_MAX 24
 
 static SDL_Window *window = NULL;
 static SDL_Renderer *renderer = NULL;
@@ -34,10 +40,12 @@ static int g_stream = 1;
 static int g_show_window = 1;
 static int g_frame_skip = 1; // send every Nth frame (1 = all)
 static int g_frame_i = 0;
+static int g_strip_h = AC_STRIP_H_DEFAULT;
 static CURL *g_curl = NULL;
 static char g_url[512];
+/* Full scaled frame in RGB565 LE (host has RAM; cube only gets strips) */
 static uint16_t g_rgb565[AC_W * AC_H];
-static struct curl_slist *g_headers = NULL;
+static struct curl_slist *g_base_headers = NULL;
 
 static unsigned char convertToDoomKey(unsigned int key)
 {
@@ -112,6 +120,16 @@ static void parse_args(void)
     if (env && atoi(env) > 0) {
         g_frame_skip = atoi(env);
     }
+    env = getenv("AGENTCUBE_STRIP_H");
+    if (env && atoi(env) > 0) {
+        g_strip_h = atoi(env);
+        if (g_strip_h > AC_STRIP_H_MAX) {
+            g_strip_h = AC_STRIP_H_MAX;
+        }
+        if (g_strip_h < 1) {
+            g_strip_h = 1;
+        }
+    }
     // -agentcube host:port
     int p = M_CheckParmWithArgs("-agentcube", 1);
     if (p > 0 && p + 1 < myargc) {
@@ -129,6 +147,16 @@ static void parse_args(void)
         g_frame_skip = atoi(myargv[p + 1]);
         if (g_frame_skip < 1) {
             g_frame_skip = 1;
+        }
+    }
+    p = M_CheckParmWithArgs("-striph", 1);
+    if (p > 0 && p + 1 < myargc) {
+        g_strip_h = atoi(myargv[p + 1]);
+        if (g_strip_h > AC_STRIP_H_MAX) {
+            g_strip_h = AC_STRIP_H_MAX;
+        }
+        if (g_strip_h < 1) {
+            g_strip_h = 1;
         }
     }
 }
@@ -158,33 +186,23 @@ static void stream_init(void)
     } else {
         snprintf(g_url, sizeof(g_url), "http://%s/api/v1/draw/frame", g_host);
     }
-    g_headers = curl_slist_append(NULL, "Content-Type: application/octet-stream");
-    g_headers = curl_slist_append(g_headers, "X-Frame-X: 0");
-    g_headers = curl_slist_append(g_headers, "X-Frame-Y: 0");
-    g_headers = curl_slist_append(g_headers, "X-Frame-W: 240");
-    g_headers = curl_slist_append(g_headers, "X-Frame-H: 240");
+    g_base_headers = curl_slist_append(NULL, "Content-Type: application/octet-stream");
+    g_base_headers = curl_slist_append(g_base_headers, "X-Frame-X: 0");
+    g_base_headers = curl_slist_append(g_base_headers, "X-Frame-W: 240");
 
     curl_easy_setopt(g_curl, CURLOPT_URL, g_url);
-    curl_easy_setopt(g_curl, CURLOPT_HTTPHEADER, g_headers);
     curl_easy_setopt(g_curl, CURLOPT_POST, 1L);
     curl_easy_setopt(g_curl, CURLOPT_WRITEFUNCTION, curl_discard);
-    curl_easy_setopt(g_curl, CURLOPT_TIMEOUT_MS, 500L);
-    curl_easy_setopt(g_curl, CURLOPT_CONNECTTIMEOUT_MS, 300L);
+    curl_easy_setopt(g_curl, CURLOPT_TIMEOUT_MS, 2000L);
+    curl_easy_setopt(g_curl, CURLOPT_CONNECTTIMEOUT_MS, 500L);
     curl_easy_setopt(g_curl, CURLOPT_NOSIGNAL, 1L);
-    fprintf(stderr, "agentcube: streaming to %s\n", g_url);
+    curl_easy_setopt(g_curl, CURLOPT_TCP_NODELAY, 1L);
+    fprintf(stderr, "agentcube: streaming to %s (strips H=%d, ~%d bytes each)\n",
+            g_url, g_strip_h, AC_W * g_strip_h * 2);
 }
 
-static void stream_frame(void)
+static void scale_frame_to_rgb565(void)
 {
-    if (!g_stream || !g_curl || !DG_ScreenBuffer) {
-        return;
-    }
-    g_frame_i++;
-    if ((g_frame_i % g_frame_skip) != 0) {
-        return;
-    }
-
-    // DG_ScreenBuffer: RGB888 as uint32_t (low 24 bits), RESX x RESY
     const int sw = DOOMGENERIC_RESX;
     const int sh = DOOMGENERIC_RESY;
     const pixel_t *src = DG_ScreenBuffer;
@@ -202,12 +220,67 @@ static void stream_frame(void)
             g_rgb565[y * AC_W + x] = c;
         }
     }
+}
 
-    curl_easy_setopt(g_curl, CURLOPT_POSTFIELDS, (const char *)g_rgb565);
-    curl_easy_setopt(g_curl, CURLOPT_POSTFIELDSIZE, (long)sizeof(g_rgb565));
+static int post_strip(int y0, int h)
+{
+    char hdr_y[48];
+    char hdr_h[48];
+    snprintf(hdr_y, sizeof(hdr_y), "X-Frame-Y: %d", y0);
+    snprintf(hdr_h, sizeof(hdr_h), "X-Frame-H: %d", h);
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/octet-stream");
+    headers = curl_slist_append(headers, "X-Frame-X: 0");
+    headers = curl_slist_append(headers, "X-Frame-W: 240");
+    headers = curl_slist_append(headers, hdr_y);
+    headers = curl_slist_append(headers, hdr_h);
+
+    size_t nbytes = (size_t)AC_W * (size_t)h * 2U;
+    const char *body = (const char *)&g_rgb565[y0 * AC_W];
+
+    curl_easy_setopt(g_curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(g_curl, CURLOPT_POSTFIELDS, body);
+    curl_easy_setopt(g_curl, CURLOPT_POSTFIELDSIZE, (long)nbytes);
+
     CURLcode rc = curl_easy_perform(g_curl);
-    if (rc != CURLE_OK && (g_frame_i % 60) == 0) {
-        fprintf(stderr, "agentcube: curl %s\n", curl_easy_strerror(rc));
+    long http = 0;
+    curl_easy_getinfo(g_curl, CURLINFO_RESPONSE_CODE, &http);
+    curl_slist_free_all(headers);
+
+    if (rc != CURLE_OK) {
+        if ((g_frame_i % 60) == 0) {
+            fprintf(stderr, "agentcube: curl %s (y=%d h=%d)\n", curl_easy_strerror(rc), y0, h);
+        }
+        return -1;
+    }
+    if (http != 200 && (g_frame_i % 60) == 0) {
+        fprintf(stderr, "agentcube: HTTP %ld (y=%d h=%d)\n", http, y0, h);
+        return -1;
+    }
+    return 0;
+}
+
+static void stream_frame(void)
+{
+    if (!g_stream || !g_curl || !DG_ScreenBuffer) {
+        return;
+    }
+    g_frame_i++;
+    if ((g_frame_i % g_frame_skip) != 0) {
+        return;
+    }
+
+    scale_frame_to_rgb565();
+
+    for (int y = 0; y < AC_H; y += g_strip_h) {
+        int h = g_strip_h;
+        if (y + h > AC_H) {
+            h = AC_H - y;
+        }
+        if (post_strip(y, h) != 0) {
+            break;
+        }
     }
 }
 

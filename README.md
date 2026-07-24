@@ -50,7 +50,7 @@ Or from repo root:
 Terminal 1 — sim:
 
 ```bash
-cd /path/to/agentcube-sim
+cd /path/to/agentcube-sim   # or geekmagic/simulator
 python3 agentcube_sim.py
 # open http://127.0.0.1:8765/screen
 ```
@@ -64,6 +64,42 @@ export AGENTCUBE_HOST=127.0.0.1:8765
   -agentcube 127.0.0.1:8765
 ```
 
+## Run on a real cube (ESP8266 / GeekMagic)
+
+The cube only accepts **strips** of RGB565 (max ~12 KB/request). This client sends horizontal bands (default **H=16** → 7680 bytes, 15 POSTs per frame).
+
+```bash
+cd /Users/dandare/Work/agentcube-doom   # or your clone
+# build once
+cd doomgeneric-src/doomgeneric && make -f Makefile.agentcube -j$(sysctl -n hw.ncpu) && cd ../..
+
+# stream to cube LAN IP (token not required on open AgentCube builds)
+export AGENTCUBE_HOST=192.168.1.97
+export AGENTCUBE_FRAME_SKIP=2          # optional: less Wi‑Fi load
+# export AGENTCUBE_STRIP_H=12          # optional: thinner strips if Wi‑Fi drops
+
+./doomgeneric-src/doomgeneric/doomgeneric-agentcube \
+  -iwad wads/DOOM1.WAD \
+  -agentcube 192.168.1.97 \
+  -frameskip 2
+```
+
+Quick API smoke test (no Doom):
+
+```bash
+# red strip at top
+python3 - <<'PY'
+import urllib.request, struct
+w,h=240,20
+body=struct.pack('<H', 0xF800)*(w*h)
+req=urllib.request.Request(
+  'http://192.168.1.97/api/v1/draw/frame', data=body, method='POST',
+  headers={'Content-Type':'application/octet-stream',
+           'X-Frame-X':'0','X-Frame-Y':'0','X-Frame-W':str(w),'X-Frame-H':str(h)})
+print(urllib.request.urlopen(req, timeout=5).read())
+PY
+```
+
 ### Options
 
 | Flag / env | Meaning |
@@ -72,7 +108,9 @@ export AGENTCUBE_HOST=127.0.0.1:8765
 | `-nostream` | Only local SDL window |
 | `-nowindow` | Hidden SDL window (still needs video for events) |
 | `-frameskip N` | Send every Nth frame (default 1) |
+| `-striph N` | Strip height in lines (default 20, max 24) |
 | `AGENTCUBE_FRAME_SKIP` | Same as frameskip |
+| `AGENTCUBE_STRIP_H` | Same as striph |
 | `AGENTCUBE_STREAM=0` | Disable stream |
 
 Controls: arrows, Ctrl fire, Space use, Esc menu (classic Doom).
@@ -81,10 +119,9 @@ Controls: arrows, Ctrl fire, Space use, Esc menu (classic Doom).
 
 1. Engine fills `DG_ScreenBuffer` (RGB888 `uint32`, default **640×400**).
 2. `DG_DrawFrame` presents to SDL (optional).
-3. Nearest-neighbour scale → **240×240**.
-4. Convert to **RGB565 LE**.
-5. `POST http://HOST/api/v1/draw/frame` with raw body (~115 200 bytes).
-
+3. Nearest-neighbour scale → **240×240** RGB565 LE (in host RAM).
+4. Stream as **horizontal strips** via `POST /api/v1/draw/frame` with headers  
+   `X-Frame-X/Y/W/H` (body = `W*H*2` bytes, ≤ ~12 KB on ESP8266).
 ## Layout
 
 ```
